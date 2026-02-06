@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Observed Tide Tables from SWMP Depth</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- CDN libraries -->
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/luxon@3/build/global/luxon.min.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+<style>
+  :root { --fg:#1f2937; --muted:#6b7280; --accent:#0ea5e9; }
+  body { font: 16px system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color:var(--fg); margin: 1rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 0.5rem; }
+  .row { margin: 0.5rem 0; display:flex; flex-wrap:wrap; gap:1rem; align-items:center; }
+  label { color: var(--muted); font-weight: 600; }
+  input[type="number"], input[type="date"], select, button { padding: 0.4rem 0.5rem; }
+  button.primary { background: var(--accent); color:white; border:0; border-radius:4px; }
+  button:disabled { opacity: 0.5; }
+  #plot { height: 360px; margin-top: 0.5rem; }
+  table { border-collapse: collapse; margin-top: 1rem; width: 100%; max-width: 900px; }
+  th, td { border: 1px solid #e5e7eb; padding: 0.4rem 0.6rem; text-align:left; }
+  th { background:#f9fafb; }
+  .note { color: var(--muted); font-size: 0.9rem; }
+  .pill { padding: 0.1rem 0.4rem; background:#eef6ff; border:1px solid #dbeafe; border-radius:12px; }
+</style>
+</head>
+<body>
+  <h1>Observed Tide Tables from SWMP Depth</h1>
+  <p class="note">
+    Upload a SWMP CSV containing <strong>Depth</strong> and <strong>F_Depth</strong> (15‑min interval). Only rows with <code>&lt;0&gt;</code> in <strong>F_Depth</strong> are used.
+  </p>
+
+  <div class="row">
+    <input type="file" id="file" accept=".csv" />
+    <span class="pill">QC: F_Depth = &lt;0&gt; only</span>
+  </div>
+
+  <div class="row">
+    <label for="startDate">Time window:</label>
+    <input type="date" id="startDate">
+    <span>to</span>
+    <input type="date" id="endDate">
+  </div>
+
+  <div class="row">
+    <label for="tidalType">Tidal type:</label>
+    <select id="tidalType" title="Choose how to format daily tables">
+      <option value="semidiurnal" selected>Semidiurnal (2 highs / 2 lows)</option>
+      <option value="diurnal">Diurnal (1 high / 1 low)</option>
+      <option value="auto">Auto (per day)</option>
+    </select>
+
+    <label for="tz">Timezone:</label>
+    <select id="tz">
+      <option value="America/New_York" selected>America/New_York</option>
+      <option value="UTC">UTC</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <label for="smoothHours">Smoothing (hours):</label>
+    <input type="number" id="smoothHours" value="1.0" step="0.25" min="0" max="6">
+    <label for="sepHours">Min peak separation (hours):</label>
+    <input type="number" id="sepHours" value="5.5" step="0.5" min="1" max="12">
+    <label for="minProm">Min prominence (m):</label>
+    <input type="number" id="minProm" value="0.02" step="0.01" min="0" max="5">
+  </div>
+
+  <div class="row">
+    <button id="runBtn" class="primary">Generate tide table</button>
+    <button id="downloadBtn" disabled>Download CSV</button>
+  </div>
+
+  <div id="plot"></div>
+  <div id="table"></div>
+
+<script>
+const DateTime = luxon.DateTime;
+
+/* ---------- Helpers ---------- */
+
+// Extract first float from a string (e.g., "1.23 (CND) [XYZ]" -> 1.23)
+function firstFloat(s) {
+  const m = (s||'').toString().match(/[-+]?\d*\.?\d+/);
+  return m ? parseFloat(m[0]) : null;
+}
+// F_Depth == <0> ?
+function isGoodFlag(s) {
+  return /<\s*0\s*>/.test((s||'').toString());
+}
+// Rolling window helpers (median, mean)
+function rolling(arr, win, fn) {
+  const out = new Array(arr.length).fill(null);
+  const half = Math.floor(win/2);
+  for (let i=0; i<arr.length; i++) {
+    const a = Math.max(0, i-half);
+    const b = Math.min(arr.length-1, i+half);
+    const slice = arr.slice(a, b+1).filter(x => x!=null && !Number.isNaN(x));
+    if (!slice.length) continue;
+    out[i] = fn(slice);
+  }
+  return out;
+}
+const mean = a => a.reduce((s,x)=>s+x,0)/a.length;
+const median = a => {
+  const s = [...a].sort((x,y)=>x-y);
+  const m = Math.floor(s.length/2);
+  return s.length%2 ? s[m] : 0.5*(s[m-1]+s[m]);
+};
+// Find local extrema (sign change of first difference)
+function findExtrema(times, vals) {
+  const d = [];
+  for (let i=1; i<vals.length; i++) d.push(vals[i]-vals[i-1]);
+  const sgn = d.map(x => Math.sign(x));
+  const highs = [], lows = [];
+  for (let i=1; i<sgn.length; i++) {
+    if (sgn[i-1] > 0 && sgn[i] < 0) highs.push({t: times[i], v: vals[i]});
+    if (sgn[i-1] < 0 && sgn[i] > 0) lows.push({t: times[i], v: vals[i]});
+  }
+  return {highs, lows};
+}
+// Enforce minimum time separation
+function enforceSeparation(points, hours) {
+  const out = [];
+  const minMs = hours*3600*1000;
+  for (const p of points) {
+    if (!out.length || (p.t - out[out.length-1].t) >= minMs) out.push(p);
+  }
+  return out;
+}
+// Enforce minimum prominence (relative to local neighborhood)
+function enforceProminence(points, times, vals, minProm) {
+  if (minProm <= 0) return points;
+  const timeToIdx = new Map(times.map((t,i)=>[t,i]));
+  const win = 4; // ~1 hour on 15-min data
+  const out=[];
+  for (const p of points) {
+    const i = timeToIdx.get(p.t);
+    const a = Math.max(0, i-win);
+    const b = Math.min(vals.length-1, i+win);
+    const neigh = vals.slice(a,b+1);
+    const localMin = Math.min(...neigh.filter(x=>x!=null));
+    const localMax = Math.max(...neigh.filter(x=>x!=null));
+    const prominence = Math.max(p.v - localMin, localMax - p.v);
+    if (prominence >= minProm) out.push(p);
+  }
+  return out;
+}
+// Build table per day with options: semidiurnal, diurnal, auto
+function buildDailyTable(highs, lows, tidalType, tz) {
+  const byDate = new Map();
+  const dtfmt = t => DateTime.fromMillis(t, {zone: tz}).toISODate();
+  const add = (kind, p) => {
+    const d = dtfmt(p.t);
+    if (!byDate.has(d)) byDate.set(d, {date:d, highs:[], lows:[]});
+    byDate.get(d)[kind].push(p);
+  };
+  highs.forEach(p=>add('highs', p));
+  lows.forEach(p=>add('lows', p));
+  const rows=[];
+  const dates = Array.from(byDate.keys()).sort();
+  for (const d of dates) {
+    const day = byDate.get(d);
+    day.highs.sort((a,b)=>a.t-b.t);
+    day.lows.sort((a,b)=>a.t-b.t);
+
+    let H=[], L=[];
+    if (tidalType === 'semidiurnal') {
+      H = day.highs.slice(0,2);
+      L = day.lows.slice(0,2);
+    } else if (tidalType === 'diurnal') {
+      if (day.highs.length) H = [day.highs.reduce((a,b)=>a.v>b.v?a:b)];
+      if (day.lows.length)  L = [day.lows.reduce((a,b)=>a.v<b.v?a:b)];
+    } else { // auto
+      if (day.highs.length >= 2 && day.lows.length >= 2) {
+        H = day.highs.slice(0,2);
+        L = day.lows.slice(0,2);
+      } else {
+        if (day.highs.length) H = [day.highs.reduce((a,b)=>a.v>b.v?a:b)];
+        if (day.lows.length)  L = [day.lows.reduce((a,b)=>a.v<b.v?a:b)];
+      }
+    }
+    const fmt = t => t ? DateTime.fromMillis(t, {zone: tz}).toFormat('HH:mm') : '';
+    rows.push({
+      Date: d,
+      High1: H[0]?.t ? fmt(H[0].t) : '',
+      High2: H[1]?.t ? fmt(H[1].t) : '',
+      Low1:  L[0]?.t ? fmt(L[0].t) : '',
+      Low2:  L[1]?.t ? fmt(L[1].t) : ''
+    });
+  }
+  return rows;
+}
+
+/* ---------- Main ---------- */
+
+document.getElementById('runBtn').onclick = async () => {
+  const file = document.getElementById('file').files[0];
+  if (!file) { alert('Please choose a SWMP CSV file.'); return; }
+
+  const tz = document.getElementById('tz').value;
+  const tidalType = document.getElementById('tidalType').value;
+  const smoothHours = parseFloat(document.getElementById('smoothHours').value);
+  const sepHours = parseFloat(document.getElementById('sepHours').value);
+  const minProm = parseFloat(document.getElementById('minProm').value);
+
+  Papa.parse(file, {
+    header: true,
+    dynamicTyping: false,
+    skipEmptyLines: true,
+    complete: (res) => {
+      const rows = res.data;
+      // Collect good rows: F_Depth <0> only; parse DateTimeStamp; numeric Depth
+      const good = [];
+      for (const r of rows) {
+        if (!isGoodFlag(r['F_Depth'])) continue;
+        const depth = firstFloat(r['Depth']);
+        if (depth==null || Number.isNaN(depth)) continue;
+
+        // Parse "M/D/YYYY H:MM" (SWMP standard). If that fails, try Date.parse fallback.
+        let t = luxon.DateTime.fromFormat((r['DateTimeStamp']||'').toString(), 'M/d/yyyy H:mm', {zone: tz});
+        if (!t.isValid) {
+          const tmp = Date.parse(r['DateTimeStamp']);
+          if (Number.isFinite(tmp)) t = DateTime.fromMillis(tmp, {zone: tz});
+        }
+        if (!t.isValid) continue;
+
+        good.push({ t: t.toMillis(), v: depth });
+      }
+      if (!good.length) { alert('No valid rows with F_Depth = <0> and numeric Depth were found.'); return; }
+      good.sort((a,b)=>a.t-b.t);
+
+      // Restrict to user window (optional)
+      const sDate = document.getElementById('startDate').value;
+      const eDate = document.getElementById('endDate').value;
+      const t0 = sDate ? DateTime.fromISO(sDate, {zone: tz}).startOf('day').toMillis() : good[0].t;
+      const t1 = eDate ? DateTime.fromISO(eDate, {zone: tz}).endOf('day').toMillis()   : good[good.length-1].t;
+      const subset = good.filter(p => p.t >= t0 && p.t <= t1);
+      if (!subset.length) { alert('No data within the selected time window.'); return; }
+
+      // Resample to 15 min by nearest neighbor (simple, robust)
+      const ms15 = 15*60*1000;
+      const series = [];
+      const start = Math.ceil(subset[0].t / ms15)*ms15;
+      const end   = Math.floor(subset[subset.length-1].t / ms15)*ms15;
+      let j=0;
+      for (let t=start; t<=end; t+=ms15) {
+        while (j+1<subset.length && Math.abs(subset[j+1].t - t) < Math.abs(subset[j].t - t)) j++;
+        series.push({t, v: subset[j].v});
+      }
+
+      // Smoothing: short rolling median then mean (total ≈ smoothHours)
+      const vals = series.map(p=>p.v);
+      // median window: at least 3 samples; convert hours to samples
+      const medWin = Math.max(3, (2*Math.round((smoothHours*60)/15/2) + 1));
+      const meanWin = Math.max(3, Math.round((smoothHours*60)/15));
+      const med = rolling(vals, medWin, median);
+      const smo = rolling(med, meanWin, mean);
+
+      // Extrema detection + cleaning
+      const times = series.map(p=>p.t);
+      let {highs, lows} = findExtrema(times, smo);
+      highs = enforceSeparation(highs, sepHours);
+      lows  = enforceSeparation(lows,  sepHours);
+      highs = enforceProminence(highs, times, smo, minProm);
+      lows  = enforceProminence(lows,  times, smo, minProm);
+
+      // Plot
+      Plotly.newPlot('plot', [{
+        x: times.map(t=>new Date(t)), y: smo, mode:'lines', name:'Depth (smoothed)', line:{color:'#2563eb'}
+      },{
+        x: highs.map(p=>new Date(p.t)), y: highs.map(p=>p.v),
+        mode:'markers', name:'Highs', marker:{color:'#ef4444', size:8}
+      },{
+        x: lows.map(p=>new Date(p.t)), y: lows.map(p=>p.v),
+        mode:'markers', name:'Lows', marker:{color:'#0ea5e9', size:8}
+      }], {
+        margin:{t:20}, xaxis:{title:'Time ('+tz+')'}, yaxis:{title:'Depth (m)'}
+      });
+
+      // Build daily table
+      const table = buildDailyTable(highs, lows, tidalType, tz);
+      const tblDiv = document.getElementById('table');
+      const header = '<tr><th>Date</th><th>High1</th><th>High2</th><th>Low1</th><th>Low2</th></tr>';
+      const rowsHtml = table.map(r=>`<tr><td>${r.Date}</td><td>${r.High1}</td><td>${r.High2}</td><td>${r.Low1}</td><td>${r.Low2}</td></tr>`).join('');
+      tblDiv.innerHTML = `<table>${header}${rowsHtml}</table>`;
+
+      // CSV export
+      const csvHead = 'Date,High1,High2,Low1,Low2\n';
+      const csvBody = table.map(r=>[r.Date, r.High1, r.High2, r.Low1, r.Low2].join(',')).join('\n');
+      const blob = new Blob([csvHead+csvBody], {type:'text/csv;charset=utf-8;'});
+      const url = URL.createObjectURL(blob);
+      const dl = document.getElementById('downloadBtn');
+      dl.onclick = () => {
+        const a = document.createElement('a');
+        a.href = url; a.download = 'tide_table.csv';
+        document.body.appendChild(a); a.click(); a.remove();
+      };
+      dl.disabled = false;
+    }
+  });
+};
+</script>
+</body>
+</html>
